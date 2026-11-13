@@ -18,6 +18,7 @@ os.environ.setdefault("ARCHIVE_DATA_DIR", str(ROOT / "data" / "test"))
 os.environ.setdefault(
     "ARCHIVE_DB_PATH", str(ROOT / "data" / "test" / "test.sqlite3")
 )
+os.environ.setdefault("ARCHIVE_RELOCATE_THREAD", "0")
 
 if importlib.util.find_spec("fastapi") is None:
     sys.path.insert(0, str(ROOT / "tests" / "_shim"))

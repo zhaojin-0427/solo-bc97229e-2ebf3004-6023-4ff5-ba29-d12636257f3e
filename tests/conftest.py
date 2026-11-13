@@ -21,3 +21,6 @@ os.environ.setdefault("ARCHIVE_DATA_DIR", str(ROOT / "data" / "test"))
 os.environ.setdefault(
     "ARCHIVE_DB_PATH", str(ROOT / "data" / "test" / "test.sqlite3")
 )
+# Deterministic tests drive relocation batches explicitly instead of racing
+# the background worker thread.
+os.environ.setdefault("ARCHIVE_RELOCATE_THREAD", "0")

@@ -32,6 +32,18 @@ STATE_READY = "ready"
 STATE_FAILED = "failed"
 TERMINAL_STATES = (STATE_READY, STATE_FAILED)
 
+# Citation location states (relative to the document's currently active version).
+CITE_LOCATED = "located"
+CITE_PENDING_REVIEW = "pending_review"
+CITE_RELOCATING = "relocating"
+CITE_STATES = (CITE_LOCATED, CITE_PENDING_REVIEW, CITE_RELOCATING)
+
+# Relocation job states.
+JOB_PENDING = "pending"
+JOB_PROCESSING = "processing"
+JOB_DONE = "done"
+JOB_SUPERSEDED = "superseded"
+
 
 def get_conn(db_path: Optional[str] = None) -> sqlite3.Connection:
     """Open a connection with sane durability/concurrency settings."""
@@ -77,6 +89,62 @@ def init_schema(conn: sqlite3.Connection) -> None:
             block_count  INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_versions_doc ON versions(doc_id, state);
+
+        -- Citations captured by researchers against a specific document
+        -- version. The immutable capture (quote + origin block) lives here;
+        -- the *current* placement of that quote is tracked separately in
+        -- citation_locations so a slow relocation never mutates the capture.
+        CREATE TABLE IF NOT EXISTS citations (
+            citation_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id             TEXT NOT NULL,
+            created_version_id INTEGER NOT NULL,
+            block_id           TEXT NOT NULL,
+            char_start         INTEGER NOT NULL,
+            char_end           INTEGER NOT NULL,
+            quote              TEXT NOT NULL,
+            created_at         REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_citations_doc
+            ON citations(doc_id, citation_id);
+
+        CREATE TABLE IF NOT EXISTS citation_locations (
+            citation_id        INTEGER PRIMARY KEY
+                               REFERENCES citations(citation_id),
+            doc_id             TEXT NOT NULL,
+            located_version_id INTEGER NOT NULL,
+            state              TEXT NOT NULL,
+            block_id           TEXT,
+            page               INTEGER,
+            char_start         INTEGER,
+            char_end           INTEGER,
+            quote              TEXT NOT NULL,
+            block_text_hash    TEXT,
+            review_reason      TEXT,
+            updated_at         REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_locations_doc
+            ON citation_locations(doc_id, state);
+
+        -- Durable queue of background relocations. Jobs survive a process
+        -- restart; workers claim 'pending'/'processing' rows and mark them
+        -- 'done' or 'superseded' (a newer version switch wins).
+        CREATE TABLE IF NOT EXISTS relocation_jobs (
+            job_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id           TEXT NOT NULL,
+            from_version_id  INTEGER,
+            to_version_id    INTEGER NOT NULL,
+            state            TEXT NOT NULL,
+            last_citation_id INTEGER NOT NULL DEFAULT 0,
+            total_citations  INTEGER NOT NULL DEFAULT 0,
+            processed        INTEGER NOT NULL DEFAULT 0,
+            error            TEXT,
+            created_at       REAL NOT NULL,
+            updated_at       REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reljobs_state
+            ON relocation_jobs(state, job_id);
+        CREATE INDEX IF NOT EXISTS idx_reljobs_doc
+            ON relocation_jobs(doc_id, job_id);
         """
     )
     conn.commit()
@@ -195,11 +263,12 @@ def fail_version(conn: sqlite3.Connection, vid: int, error: str) -> None:
 
 def activate_version(
     conn: sqlite3.Connection, doc_id: str, vid: int, block_count: int
-) -> None:
+) -> Optional[int]:
     """Atomically point the document at the newly built version.
 
-    The catalog flip happens in one transaction; the old version's tables are
-    dropped afterwards in a second transaction so readers always see either the
+    Returns the previously active version id (or ``None``). The catalog flip
+    happens in one transaction; the old version's tables are dropped
+    afterwards in a second transaction so readers always see either the
     complete old version or the complete new one.
     """
     old = conn.execute(
@@ -219,6 +288,7 @@ def activate_version(
     if old_vid is not None and old_vid != vid:
         with transaction(conn):
             drop_version_tables(conn, old_vid)
+    return old_vid
 
 
 def get_active_version(conn: sqlite3.Connection, doc_id: str) -> Optional[int]:
